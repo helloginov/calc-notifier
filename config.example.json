@@ -1,0 +1,16 @@
+{
+    "telegram": {
+        "enabled": false,
+        "token": "",
+        "chat_id": ""
+    },
+    "metrics": {
+        "enabled": true,
+        "port": 8000
+    },
+    "history_dir": "./calc_notifier_history",
+    "report": {
+        "default_interval": 100,
+        "keep_last": 3
+    }
+}

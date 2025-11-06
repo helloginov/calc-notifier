@@ -206,3 +206,39 @@ def report(self, title: str, figure=None, images: Optional[List[str]] = None, ex
         if send and self._tg is not None:
             # offload to executor
             self._executor.submit(self._send_report_bg, folder, title, meta['extra_info'], saved_images)
+
+
+    def _send_report_bg(self, folder, title, extra_info, saved_images):
+        try:
+            # send and manage deletions of old messages
+            msg_id = self._tg.send_report(folder, title, extra_info, saved_images)
+            # save in state
+            with self._state_lock:
+                sent = self._state.get('sent', [])
+                sent.append({'folder': folder, 'msg_id': msg_id, 'ts': datetime.now(datetime.timezone.utc).isoformat()})
+                # keep only last N
+                keep = int(self.config['report'].get('keep_last', 3))
+                # delete older if length > keep
+                while len(sent) > keep:
+                    old = sent.pop(0)
+                    try:
+                        # old['msg_id'] may be None if failed
+                        if old.get('msg_id'):
+                            self._tg.delete_message(old['msg_id'])
+                    except Exception:
+                        pass
+                self._state['sent'] = sent
+                self._save_state()
+        except Exception as e:
+            try:
+                with open(os.path.join(folder, 'send_error.txt'), 'w', encoding='utf-8') as f:
+                    f.write(traceback.format_exc())
+            except Exception:
+                pass
+
+    def report_exception(self, exc: Exception, context: Optional[str] = None, send: bool = True):
+        tb = traceback.format_exc()
+        title = f"Exception: {type(exc).__name__}"
+        text = f"Context: {context}\n\n```{tb}\n```"
+        # save in history and try to send
+        self.report(title, figure=None, images=None, extra_info={'exception': tb, 'context': context}, send=send)

@@ -1,0 +1,5 @@
+requests
+prometheus-client
+matplotlib
+Pillow
+reportlab #(optional, for multi-page PDF assembly)
