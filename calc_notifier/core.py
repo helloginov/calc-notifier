@@ -1,99 +1,47 @@
 import os
 import time
-import warnings
 import json
+import shutil
+import functools
 import traceback
-import threading
-from concurrent.futures import ThreadPoolExecutor
+from colorama import Fore, Style
 from datetime import datetime
-from typing import Optional, List, Dict, Any
-
-from prometheus_client import start_http_server, Gauge
-
-from .telegram import TelegramClient
-from .utils import ensure_dir, save_figure_to_file, assemble_pdf_if_possible
-
+from concurrent.futures import ThreadPoolExecutor
+from typing import List, Optional
+from .utils import ensure_dir, save_figure_to_file, assemble_pdf, markdown_v2_escape
+from .telegram_client import SimpleTelegramAPI
 
 DEFAULT_CONFIG = {
-    "telegram": {
-        "enabled": False,
-        "token": "",
-        "chat_id": "",
-    },
-    "metrics": {
-        "enabled": True,
-        "port": 8000,
-    },
+    "telegram": {"enabled": False, "token": "", "chat_id": ""},
     "history_dir": "./calc_notifier_history",
-    "report": {
-        "default_interval": 100,
-        "keep_last": 3,
-    }
+    "keep_last": 3
 }
 
 class Notifier:
-    """Основной класс.
-
-    Важное поведение:
-    - start_metrics_server(port) запускает prometheus endpoint
-    - log_metric(name, value) обновляет или создаёт Gauge
-    - report(...) собирает и отправляет отчёт (в фоне)
-    - все сетевые ошибки ловятся и логируются в истории
-    """
-
     def __init__(self, config_path: Optional[str] = None, config_override: Optional[dict] = None):
-        self._gauges: Dict[str, Gauge] = {}
-        self._gauges_lock = threading.RLock()
-        self._metrics_started = False
-        self._executor = ThreadPoolExecutor(max_workers=2)
-
-        # config
         self.config = DEFAULT_CONFIG.copy()
         if config_path and os.path.exists(config_path):
             try:
-                with open(config_path, 'r', encoding='utf-8') as f:
-                    user_conf = json.load(f)
-                self._deep_update(self.config, user_conf)
+                with open(config_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self._deep_update(self.config, data)
             except Exception:
-                warnings.warn("Не удалось прочитать config, используем дефолт")
+                pass
         if config_override:
             self._deep_update(self.config, config_override)
 
-
-        self.history_dir = os.path.abspath(self.config.get('history_dir', './calc_notifier_history'))
+        self.history_dir = os.path.abspath(self.config.get("history_dir"))
         ensure_dir(self.history_dir)
+        self.keep_last = int(self.config.get("keep_last", 3))
 
-        # Telegram client (может быть выключен)
-        tel_conf = self.config.get('telegram', {})
-        if tel_conf.get('enabled') and tel_conf.get('token') and tel_conf.get('chat_id'):
-            self._tg = TelegramClient(tel_conf['token'], tel_conf['chat_id'], history_dir=self.history_dir,
-            keep_last=self.config['report'].get('keep_last', 3))
+        tel = self.config.get("telegram", {})
+        if tel.get("enabled") and tel.get("token") and tel.get("chat_id"):
+            self.tg = SimpleTelegramAPI(tel["token"], tel["chat_id"], self.history_dir)
         else:
-            self._tg = None
+            self.tg = None
 
-        # сохраняем last sent messages (в файле state.json в history_dir)
-        self._state_file = os.path.join(self.history_dir, 'state.json')
-        self._state = self._load_state()
-        self._state_lock = threading.RLock()
+        self.executor = ThreadPoolExecutor(max_workers=2)
 
-
-    def _load_state(self):
-        if os.path.exists(self._state_file):
-            try:
-                with open(self._state_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except Exception:
-                return {}
-        return {}
-    
-    def _save_state(self):
-        with self._state_lock:
-            try:
-                with open(self._state_file, 'w', encoding='utf-8') as f:
-                    json.dump(self._state, f, ensure_ascii=False, indent=2)
-            except Exception:
-                pass
-    
     def _deep_update(self, d, u):
         for k, v in u.items():
             if isinstance(v, dict) and isinstance(d.get(k), dict):
@@ -101,144 +49,201 @@ class Notifier:
             else:
                 d[k] = v
 
-    # ---------------- Prometheus ----------------
-    def start_metrics_server(self, port: Optional[int] = None):
-        if not self.config['metrics'].get('enabled', True):
-            return
-        if port is None:
-            port = self.config['metrics'].get('port', 8000)
-        try:
-            start_http_server(port)
-            self._metrics_started = True
-            print(f"Prometheus metrics server started at :{port}")
-        except Exception as e:
-            # не ломаем основной код
-            warnings.warn(f"Не удалось запустить metrics server: {e}")
+    def _make_report_folder(self):
+        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        base = os.path.join(self.history_dir, f"report_{ts}_{int(time.time()*1000)%100000}")
+        ensure_dir(base)
+        return base
 
-    
-    def log_metric(self, name: str, value: float, labels: Optional[dict] = None):
-        # для простоты не реализуем лейблы глубоко — можно расширить
-        key = name if not labels else name + json.dumps(labels, sort_keys=True)
-        with self._gauges_lock:
-            if key not in self._gauges:
-                # sanitize name: Prometheus metric name rules — заменим непозволительные символы
-                sanitized = ''.join([c if (c.isalnum() or c == '_') else '_' for c in name])
-                g = Gauge(sanitized, f"Auto metric {name}")
-                self._gauges[key] = g
-            else:
-                g = self._gauges[key]
-            try:
-                g.set(value)
-            except Exception:
-                pass
+    def save_artifact(self, folder: Optional[str] = None, pathlike: Optional[str] = None, content: Optional[bytes] = None, filename: Optional[str] = None):
+        """
+        Сохранить произвольный файл в папке отчёта (не отправляя).
+        Если folder==None, создаётся новый report folder.
+        """
+        if folder is None:
+            folder = self._make_report_folder()
+        ensure_dir(folder)
+        if pathlike:
+            dst = os.path.join(folder, os.path.basename(pathlike) if not filename else filename)
+            shutil.copyfile(pathlike, dst)
+            return dst
+        if content is not None and filename:
+            dst = os.path.join(folder, filename)
+            with open(dst, "wb") as f:
+                f.write(content)
+            return dst
+        raise ValueError("Provide pathlike or content+filename")
 
-    # ---------------- Reporting ----------------
-def report(self, title: str, figure=None, images: Optional[List[str]] = None, extra_info: Optional[dict] = None, send: bool = True):
-    """Собирает отчёт и (опционально) отправляет в Telegram.
+    def report(self,
+               title: Optional[str] = None,
+               text: Optional[str] = None,
+               figures: Optional[List] = None,
+               image_paths: Optional[List[str]] = None,
+               files: Optional[List[str]] = None,
+               send: bool = True):
+        """
+        figures: list of matplotlib.figure.Figure objects (will be saved)
+        image_paths: list of existing image files
+        files: list of other files to include (PDF will include images)
+        """
+        folder = self._make_report_folder()
 
-    - title: заголовок
-    - figure: matplotlib.figure.Figure или None
-    - images: список путей к файлам (уже сохранённых)
-    - extra_info: словарь дополнительных полей
-    - send: если False — только сохраняем в историю
-    """
-    ts = datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
-    folder_name = f"report_{ts}_{int(time.time() * 1000) % 100000}"
-    folder = os.path.join(self.history_dir, folder_name)
-    ensure_dir(folder)
-
-    saved_images = []
-    # если есть figure — сохраним
-    if figure is not None:
-        try:
-            img_path = os.path.join(folder, 'figure.png')
-            save_figure_to_file(figure, img_path)
-            saved_images.append(img_path)
-        except Exception as e:
-            tb = traceback.format_exc()
-            with open(os.path.join(folder, 'error_saving_figure.txt'), 'w', encoding='utf-8') as f:
-                f.write(tb)
-
-        # копируем переданные пути
-        if images:
-            for p in images:
-                try:
-                    bname = os.path.basename(p)
-                    dest = os.path.join(folder, bname)
-                    with open(p, 'rb') as fr, open(dest, 'wb') as fw:
-                        fw.write(fr.read())
-                    saved_images.append(dest)
-                except Exception:
-                    pass
-
-        # сохраняем текстовую часть
-        meta = {
-            'title': title,
-            'ts': ts,
-            'extra_info': extra_info or {}
-        }
-        with open(os.path.join(folder, 'meta.json'), 'w', encoding='utf-8') as f:
+        # save text
+        meta = {"title": title or "", "text": text or "", "ts": datetime.utcnow().isoformat()}
+        with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
 
-
-        # пытаемся собрать pdf (если reportlab установлен)
+        saved_images = []
         try:
-            pdf_path = os.path.join(folder, 'report.pdf')
-            assembled = assemble_pdf_if_possible(pdf_path, title, meta['extra_info'], saved_images)
-            if not assembled and os.path.exists(pdf_path):
-                try:
-                    os.remove(pdf_path)
-                except Exception:
-                    pass
+            # save figures
+            if figures:
+                for idx, fig in enumerate(figures):
+                    p = os.path.join(folder, f"figure_{idx}.png")
+                    try:
+                        save_figure_to_file(fig, p)
+                        saved_images.append(p)
+                    except Exception:
+                        # ignore figure saving errors
+                        with open(os.path.join(folder, f"figure_{idx}_error.txt"), "w", encoding="utf-8") as e:
+                            e.write(traceback.format_exc())
+            # copy image_paths
+            if image_paths:
+                for p in image_paths:
+                    try:
+                        dst = os.path.join(folder, os.path.basename(p))
+                        shutil.copyfile(p, dst)
+                        saved_images.append(dst)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
-        # логируем в state — history list
-        with self._state_lock:
-            history = self._state.get('history', [])
-            history.append({'folder': folder_name, 'title': title, 'ts': ts})
-            # ограничиваем размер истории (можно расширить)
-            self._state['history'] = history[-1000:]
-            self._save_state()
+        # copy additional files
+        saved_files = []
+        if files:
+            for p in files:
+                try:
+                    dst = os.path.join(folder, os.path.basename(p))
+                    shutil.copyfile(p, dst)
+                    saved_files.append(dst)
+                except Exception:
+                    pass
 
+        # assemble PDF (title + text + all images)
+        pdf_path = os.path.join(folder, "report.pdf")
+        assembled = assemble_pdf(pdf_path, meta["title"] or "Report", meta["text"], saved_images)
+        if not assembled:
+            # if assemble failed, still create a text file
+            with open(os.path.join(folder, "report.txt"), "w", encoding="utf-8") as f:
+                f.write(meta["title"] + "\n\n" + (meta["text"] or ""))
 
-        # отправляем (незаблокирующе)
-        if send and self._tg is not None:
-            # offload to executor
-            self._executor.submit(self._send_report_bg, folder, title, meta['extra_info'], saved_images)
+        # send if needed
+        if send and self.tg is not None:
+            # build caption: title bold + text; escape MDv2
+            title_used = meta["title"] or f"Iteration {len(self._list_reports())+1}"
+            caption = f"*{title_used}*\n\n{meta['text'] or ''}"
+            caption_escaped = markdown_v2_escape(caption)
 
+            # warn if many images
+            warn = ""
+            if len(saved_images) > 10:
+                warn = "\n\n\\_Warning\\_: more than 10 images provided; only first 10 sent to Telegram."
 
-    def _send_report_bg(self, folder, title, extra_info, saved_images):
+            final_caption = caption_escaped + warn
+
+            # prepare callable for background sending
+            self.executor.submit(self._send_and_manage_history, folder, saved_images, saved_files, pdf_path, final_caption)
+        return folder
+
+    def _list_reports(self):
+        # read state from tg state if available
+        if self.tg:
+            state = self.tg.state.get("reports", [])
+            return state
+        return []
+
+    def _send_and_manage_history(self, folder, saved_images, saved_files, pdf_path, final_caption):
+        """
+        Sends images (as media group), PDF and other files, records message ids, deletes older reports (keeping self.keep_last).
+        """
         try:
-            # send and manage deletions of old messages
-            msg_id = self._tg.send_report(folder, title, extra_info, saved_images)
-            # save in state
-            with self._state_lock:
-                sent = self._state.get('sent', [])
-                sent.append({'folder': folder, 'msg_id': msg_id, 'ts': datetime.now(datetime.timezone.utc).isoformat()})
-                # keep only last N
-                keep = int(self.config['report'].get('keep_last', 3))
-                # delete older if length > keep
-                while len(sent) > keep:
-                    old = sent.pop(0)
+            sent_message_ids = []
+            # send images as media group (first 10). caption only on first image.
+            if saved_images:
+                ids = self.tg.send_media_group(saved_images[:10], caption_md=final_caption)
+                sent_message_ids.extend(ids)
+
+            # if there is a pdf (report.pdf), send as document
+            if os.path.exists(pdf_path):
+                mid = self.tg.send_document(pdf_path, caption_md=None)
+                if mid:
+                    sent_message_ids.append(mid)
+
+            # send other files (non-images) as separate documents (no caption)
+            for f in saved_files:
+                # skip if it's the pdf we just sent (by name)
+                if os.path.abspath(f) == os.path.abspath(pdf_path):
+                    continue
+                mid = self.tg.send_document(f, caption_md=None)
+                if mid:
+                    sent_message_ids.append(mid)
+
+            # record report in state: folder + message_ids + ts
+            rec = {"folder": folder, "msg_ids": sent_message_ids, "ts": time.time()}
+            self.tg.push_report_record(rec)
+
+            # now delete older reports if more than keep_last
+            popped = self.tg.pop_old_reports(self.keep_last)
+            for old in popped:
+                for mid in old.get("msg_ids", []):
                     try:
-                        # old['msg_id'] may be None if failed
-                        if old.get('msg_id'):
-                            self._tg.delete_message(old['msg_id'])
+                        self.tg.delete_message(mid)
                     except Exception:
                         pass
-                self._state['sent'] = sent
-                self._save_state()
-        except Exception as e:
+            # done
+        except Exception:
+            # log exception into folder
             try:
-                with open(os.path.join(folder, 'send_error.txt'), 'w', encoding='utf-8') as f:
+                with open(os.path.join(folder, "send_error.txt"), "w", encoding="utf-8") as f:
                     f.write(traceback.format_exc())
             except Exception:
                 pass
 
+    # convenience for exceptions
     def report_exception(self, exc: Exception, context: Optional[str] = None, send: bool = True):
         tb = traceback.format_exc()
         title = f"Exception: {type(exc).__name__}"
-        text = f"Context: {context}\n\n```{tb}\n```"
-        # save in history and try to send
-        self.report(title, figure=None, images=None, extra_info={'exception': tb, 'context': context}, send=send)
+        short_tb = "\n".join(tb.splitlines()[-15:])  # последние строки
+        text = f"{context or 'Error occurred'}\n\n```\n{short_tb}\n```"
+        folder = self.report(title=title, text=text, figures=None, image_paths=None, files=None, send=send)
+        err_file = os.path.join(folder, "traceback.txt")
+        with open(err_file, "w", encoding="utf-8") as f:
+            f.write(tb)
+        return folder
+
+
+
+    def catch_exceptions(self, *, context=None, reraise=False):
+        """
+        Decorator to catch any exceptions inside a function and report via Telegram and local log.
+        Example:
+            @notifier.catch_exceptions(context="Main loop")
+            def run_calculations(): ...
+        """
+        def decorator(func):
+            @functools.wraps(func)
+            def wrapper(*args, **kwargs):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    tb = traceback.format_exc()
+                    folder = self.report_exception(e, context=context, send=True)
+                    err_file = os.path.join(folder, "error_traceback.txt")
+                    with open(err_file, "w", encoding="utf-8") as f:
+                        f.write(tb)
+                    print(Fore.YELLOW + f"⚠️ Exception caught in {func.__name__}: full traceback saved at {err_file}" + Style.RESET_ALL)
+                    if reraise:
+                        raise
+                    return None
+            return wrapper
+        return decorator

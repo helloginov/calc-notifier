@@ -1,14 +1,18 @@
-Минималистичный модуль для интеграции Prometheus-метрик и Telegram-отчётов в расчётный код на Python.
+calc_notifier (Telegram-only)
 
+Install:
+  pip install -r requirements.txt
 
-Ключевые возможности:
-- лёгкая интеграция — пара строчек в коде;
-- Prometheus `/metrics` (для Grafana);
-- периодические отчёты в Telegram (текст + картинки);
-- хранение истории в локальной директории (каждый отчёт в собственной папке, сохраняются картинки и текст);
-- попытка собрать PDF (если установлен reportlab);
-- отказоустойчивая отправка (не блокирует основной код, ошибки логируются, не ломают расчёт);
-- хранение только 3 последних сообщений в чате (старые удаляются).
+Configure:
+  copy config.example.json -> config.json
+  fill telegram.token and telegram.chat_id and set enabled=true
 
+Usage:
+  from calc_notifier import Notifier
+  n = Notifier("config.json")
+  n.report(title="My title", text="Details", figures=[fig], files=["some.csv"])
 
-Пример использования и демо в `demo.py`.
+Notes:
+ - Telegram: images (<=10) are sent as media group (caption on first), other files are sent as separate documents.
+ - PDF assembled with reportlab includes text and all images (one per page).
+ - The last 3 reports in the chat are deleted when a new report is sent (files on disk are not deleted).

@@ -1,5 +1,5 @@
-requests
-prometheus-client
-matplotlib
-Pillow
-reportlab #(optional, for multi-page PDF assembly)
+requests>=2.31
+matplotlib>=3.8
+Pillow>=9.5
+reportlab>=4.0
+colorama>=0.4.6
