@@ -1,4 +1,4 @@
-requests>=2.31
+requests>=2.32.5
 matplotlib>=3.8
 Pillow>=9.5
 reportlab>=4.0
