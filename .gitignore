@@ -1,2 +1,5 @@
 config.json
 .venv/Lib/site-packages/anyio/__init__.py
+.venv/
+src/calc_notifier_telegram.egg-info/
+src/calc_notifier/__pycache__/
